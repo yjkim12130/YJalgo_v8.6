@@ -40,7 +40,8 @@ def _ai_box(title,bullets,accent="#00d084"):
 
 def _ai1(sp,rp):return [f"기간{rp}|{len(sp)}개",f"저평가:<b>{sp.idxmin()}</b>({sp.min():+.1f}%)",f"고평가:<b>{sp.idxmax()}</b>({sp.max():+.1f}%)"]
 def _ai2(reg,mn,vn,cn,rn,dn,p):
-    b=[f"<b>{reg}</b>|레버{{'Bull':p.get('lev_bull',2),'Bear':p.get('lev_bear',1),'Panic':p.get('lev_panic',1.5)}.get(reg,1)}배"]
+    lv={"Bull":p.get("lev_bull",2),"Bear":p.get("lev_bear",1),"Panic":p.get("lev_panic",1.5)}.get(reg,1)
+    b=[f"<b>{reg}</b>|레버{lv}배"]
     if reg=="Panic":b.append(f"Bear이탈: CCI>0 AND RSI>{p.get('rsi_bear',50)}")
     else:b.append(f"Panic전환: VIX≥{p.get('vix_panic',30)} AND MDD≤{p.get('mdd_panic',-0.15)*100:.0f}%")
     return b
