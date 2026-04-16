@@ -1,20 +1,12 @@
 """
-YJ-Quant Dashboard v8.7 — 개선 12건 반영
+YJ-Quant Dashboard v8.8 — 개선 1건 반영
 ═══════════════════════════════════════════════════════
-v8.7 변경 (vs v8.6):
-  [#탭순서] 🌍레이더 → 📈백테스트 → 🏠지침 → 🔄WFV → 🆚비교 → 📡종목 → 🔮미래
-  [#2.5] 지침 탭: 백테스트 1위 파라미터 필수, 미실행 시 안내
-  [#10]  Panic 로그에 CMA 전/후 잔고 추가
-  [#6]   AI 해석에 Panic 전환 조건 추가
-  [#1]   자산 레이더 48mo/60mo 추가
-  [#2]   중국(상해)/유럽(FTSE,CAC40) 증시 추가
-  [#3]   지침 탭 날짜 선택 (캘린더)
-  [#4]   기준일 종가 지수 수치 표시
-  [#5]   지침 탭 지수/지표 미니 차트
-  [#7]   Sharpe/Calmar 설명 추가
-  [#8]   레짐 차트 색상 범례
-  [#12]  미래 시뮬 수익률 중심 표시
-  [#11]  P/OI 폴백 (Gross Profit, EBITDA)
+v8.8 변경 (vs v8.7):
+  [#13] Panic 단계매집 시뮬레이션 추가
+        - 반복매집(기존 v8.7): 조건 충족 시 panic_period마다 반복 매수
+        - 단계매집(신규 v8.8): 1차→2차→3차 각 단계 최초 1회만 매수
+          EX) MDD:-15% → CMA 40% 1차 매수, 이후 MDD:-35% 도달 시만 2차 매수
+        - 백테스트 탭 하단에 두 방식 수익률/MDD 비교 추가
 """
 import itertools, time
 from datetime import date, timedelta
@@ -28,7 +20,6 @@ st.set_page_config(page_title="YJ-Quant", page_icon="📈", layout="wide", initi
 TRADING_DAYS = 252; LEV_COST = 0.045; CMA_INTEREST = 0.035
 TODAY = date.today().isoformat(); CUR_YEAR = date.today().year; _D = "plotly_dark"
 
-# ★ [#2] 중국/유럽 증시 추가
 ASSET_CLASSES = {
     "S&P 500":    {"sym":"^GSPC",   "vix":"^VIX","vf":15,"cur":"$","col":"#00d084"},
     "Nasdaq":     {"sym":"^IXIC",   "vix":"^VXN","vf":20,"cur":"$","col":"#2196f3"},
@@ -91,7 +82,6 @@ def _ai_tab1(sp, rp):
     if over: b.append(f"고평가 자산: {', '.join(over)}")
     return b
 
-# ★ [#6] Panic 전환 조건 추가
 def _ai_tab2(reg, mn, vn, cn, rn, dn, p):
     sr_v=p.get("stock_ratio",15); lv_map={"Bull":p.get("lev_bull",2.0),"Bear":p.get("lev_bear",1.0),"Panic":p.get("lev_panic",1.5)}
     lv=lv_map.get(reg,1.0); b=[f"현재 상태: <b>{reg}</b> | 레버리지 {lv}배"]
@@ -151,6 +141,20 @@ def _ai_tab7(sim, yrs, method):
     prob2x=sim['target_probs'].get('100%',0)
     b=[f"{method} {yrs}년 | 중앙값 연환산 <b>{an50:.1f}%</b>",
        f"원금 2배 확률: <b>{prob2x}%</b>"]
+    return b
+
+# ★ [#13] Panic 매집방식 비교 AI 해석
+def _ai_panic_cmp(cp_res):
+    rows=[(n,r['metrics'].get('annual_return',0),r['metrics'].get('mdd',0),r['metrics'].get('calmar',0),r.get('regime_stats',{}).get('P총(만)',0)) for n,r in cp_res.items() if r and r.get('metrics')]
+    if not rows: return ["결과 없음"]
+    best_ret=max(rows,key=lambda x:x[1]); best_mdd=max(rows,key=lambda x:-x[2]); best_cal=max(rows,key=lambda x:x[3])
+    b=[f"수익률 우위: <b>{best_ret[0]}</b> ({best_ret[1]:.1f}%)",
+       f"MDD 우위: <b>{best_mdd[0]}</b> (MDD {best_mdd[2]:.1f}%)",
+       f"Calmar 우위: <b>{best_cal[0]}</b> ({best_cal[3]:.4f})"]
+    for n,ar,mdd,cal,pt in rows:
+        b.append(f"{n}: 연{ar:.1f}% | MDD {mdd:.1f}% | Panic매집 {pt:.0f}만")
+    if best_ret[0]==best_mdd[0]==best_cal[0]:
+        b.append(f"👑 <b>{best_ret[0]}</b> 수익률·MDD·Calmar 모두 우위")
     return b
 
 # ═══════════════════════ 데이터 수집 ═══════════════════════
@@ -230,16 +234,23 @@ def _mstg(ma,ms):
     elif ma>=ms[2]:return f"3단계(≥{ms[2]*100:.0f}%)"
     return "미달"
 
-# ★ [#10] Panic 로그에 CMA 잔고 추가
-def run_beta(data,params,budget,inh=None,sim_start=None,sim_end=None):
+# ★ [#13] staged 파라미터 추가
+# staged=False: v8.7 반복매집 (panic_period마다 조건 충족 시 반복 매수)
+# staged=True : v8.8 단계매집 (MDD 구간별 최초 1회만 매수: 1차→2차→3차)
+def run_beta(data,params,budget,inh=None,sim_start=None,sim_end=None,staged=False):
     df=add_ind(data);df=df.dropna(subset=["MA_200","MDD"]).copy()
     if sim_start:df=df[df.index>=pd.Timestamp(sim_start)]
     if sim_end:df=df[df.index<=pd.Timestamp(sim_end)]
     if df.empty:return _emp()
     ms=list(params["mdd_threshold_sets"]);ds=list(params["drain_sets"])
     dst=(budget*(params["stock_ratio"]/18))/TRADING_DAYS;dcs=(budget*((18-params["stock_ratio"])/18))/TRADING_DAYS
-    if inh:ys=float(inh.get("yj_st",0));yc=float(inh.get("yj_cs",0));cur=inh.get("state","Bull");pc=int(inh.get("p_cnt",0));tp=float(inh.get("total_principal",0))
-    else:ys=yc=0.0;cur="Bull";pc=0;tp=0.0
+    if inh:
+        ys=float(inh.get("yj_st",0));yc=float(inh.get("yj_cs",0));cur=inh.get("state","Bull")
+        pc=int(inh.get("p_cnt",0));tp=float(inh.get("total_principal",0))
+        panic_stage=int(inh.get("panic_stage",0))  # ★ 단계매집: 이전 단계 기억
+    else:
+        ys=yc=0.0;cur="Bull";pc=0;tp=0.0
+        panic_stage=0  # ★ 0=미매수, 1=1차완료, 2=2차완료, 3=3차완료
     recs,slogs,plogs,elogs=[],[],[],[];pt=0.0;panic_ep=None
     for dt,row in df.iterrows():
         dr=float(row.get("Daily_Ret",0) or 0);vx=float(row.get("VIX",15));cc=float(row.get("CCI",0))
@@ -247,16 +258,35 @@ def run_beta(data,params,budget,inh=None,sim_start=None,sim_end=None):
         pv=cur;cur=_state(cur,vx,cc,rs,md,dp,params)
         lv={"Bull":params["lev_bull"],"Bear":params["lev_bear"],"Panic":params["lev_panic"]}[cur]
         if cur!=pv:slogs.append({"날짜":dt.date(),"변화":f"{pv}→{cur}","VIX":round(vx,1),"MDD%":round(md*100,1),"CCI":round(cc,1),"RSI":round(rs,1),"Disp%":round(dp,1),"레버리지":lv})
+        # ★ Panic 탈출 시 단계 초기화
+        if pv=="Panic" and cur!="Panic":panic_stage=0
         tp+=budget/TRADING_DAYS
         if dr:ys*=1+dr*lv-max(0,lv-1)*(LEV_COST/TRADING_DAYS)
         yc*=1+CMA_INTEREST/TRADING_DAYS;ys+=dst;yc+=dcs
         if cur=="Panic":
             if panic_ep is None:panic_ep={"시작":dt.date(),"종료":"-","지속일":0,"전CMA(만)":round(yc/1e4,1),"후CMA(만)":0.0,"총매집(만)":0.0,"최대MDD%":round(md*100,1),"상태":"진행중"}
-            if pc%params["panic_period"]==0:
-                m=abs(md);dr2=(ds[0] if m>=ms[0] else ds[1] if m>=ms[1] else ds[2] if m>=ms[2] else 0)
-                if dr2>0:
-                    pb=min((yc*dr2)/params["periodic_denom"],yc);cma_b=yc;ys+=pb;yc-=pb;pt+=pb
-                    plogs.append({"날짜":dt.date(),"MDD%":round(md*100,1),"단계":_mstg(m,ms),"매수(만)":round(pb/1e4,1),"CMA전(만)":round(cma_b/1e4,1),"CMA후(만)":round(yc/1e4,1),"누적(만)":round(pt/1e4,1),"VIX":round(vx,1)})
+            if staged:
+                # ★ 단계매집: MDD 구간 진입 시 해당 단계 최초 1회만 매수
+                m=abs(md)
+                new_stage=(3 if m>=ms[0] else 2 if m>=ms[1] else 1 if m>=ms[2] else 0)
+                if new_stage>panic_stage and new_stage>0:
+                    dr2={1:ds[2],2:ds[1],3:ds[0]}[new_stage]  # stage1→ds[2], stage2→ds[1], stage3→ds[0]
+                    if dr2>0 and yc>0:
+                        pb=min(yc*dr2,yc);cma_b=yc;ys+=pb;yc-=pb;pt+=pb
+                        panic_stage=new_stage
+                        plogs.append({"날짜":dt.date(),"MDD%":round(md*100,1),"단계":_mstg(m,ms),
+                                      "매수차수":f"{new_stage}차","매수(만)":round(pb/1e4,1),
+                                      "CMA전(만)":round(cma_b/1e4,1),"CMA후(만)":round(yc/1e4,1),
+                                      "누적(만)":round(pt/1e4,1),"VIX":round(vx,1)})
+            else:
+                # ★ 반복매집(기존 v8.7): panic_period마다 조건 충족 시 반복 매수
+                if pc%params["panic_period"]==0:
+                    m=abs(md);dr2=(ds[0] if m>=ms[0] else ds[1] if m>=ms[1] else ds[2] if m>=ms[2] else 0)
+                    if dr2>0:
+                        pb=min((yc*dr2)/params["periodic_denom"],yc);cma_b=yc;ys+=pb;yc-=pb;pt+=pb
+                        plogs.append({"날짜":dt.date(),"MDD%":round(md*100,1),"단계":_mstg(m,ms),
+                                      "매수(만)":round(pb/1e4,1),"CMA전(만)":round(cma_b/1e4,1),
+                                      "CMA후(만)":round(yc/1e4,1),"누적(만)":round(pt/1e4,1),"VIX":round(vx,1)})
             if panic_ep:panic_ep["지속일"]+=1;panic_ep["최대MDD%"]=min(panic_ep["최대MDD%"],round(md*100,1));panic_ep["총매집(만)"]=round(pt/1e4,1)
         else:
             if panic_ep is not None:panic_ep["종료"]=dt.date();panic_ep["후CMA(만)"]=round(yc/1e4,1);panic_ep["상태"]="✅충분" if yc>1e6 else "⚠️부족";elogs.append(panic_ep);panic_ep=None
@@ -266,7 +296,8 @@ def run_beta(data,params,budget,inh=None,sim_start=None,sim_end=None):
     if not recs:return _emp()
     eq=pd.DataFrame(recs).set_index("time");sc=eq["state"].value_counts()
     rstat={"Bull":int(sc.get("Bull",0)),"Bear":int(sc.get("Bear",0)),"Panic":int(sc.get("Panic",0)),"전환":len(slogs),"P매수":len(plogs),"P총(만)":round(pt/1e4,1)}
-    return {"equity_curve":eq,"dca_curve":_dca(df,budget),"metrics":_met(eq),"state_logs":slogs,"panic_logs":plogs,"panic_episodes":elogs,"regime_stats":rstat,"final_state":{"yj_st":ys,"yj_cs":yc,"state":cur,"p_cnt":pc,"total_principal":tp}}
+    return {"equity_curve":eq,"dca_curve":_dca(df,budget),"metrics":_met(eq),"state_logs":slogs,"panic_logs":plogs,"panic_episodes":elogs,"regime_stats":rstat,
+            "final_state":{"yj_st":ys,"yj_cs":yc,"state":cur,"p_cnt":pc,"total_principal":tp,"panic_stage":panic_stage}}
 
 def run_alpha(data,sc2,spy,params,budget,alpha_dca_ratio=0.0,inh=None,sim_start=None,sim_end=None):
     df=add_ind(data);df=df.dropna(subset=["MA_200","MDD"]).copy()
@@ -424,7 +455,6 @@ def analyze_oh(ticker):
     sig="🟢매수" if (cp<=bzh or rsi<45) else ("🔴과열" if rsi>70 else "🟡관망")
     return {"ticker":ticker,"price":cp,"ma50":m5,"ma200":m2,"rsi":rsi,"dd":dd,"atr":atr,"buy_zone":f"${bzl:.2f}~${bzh:.2f}","sl":fsl,"sl_pct":(fsl/cp-1)*100,"signal":sig,"vs_ma200":(cp/m2-1)*100}
 
-# ★ [#11] P/OI 폴백
 @st.cache_data(ttl=3600,show_spinner=False)
 def analyze_rv(tickers,period="12mo"):
     raw=_yf(tickers,f"{CUR_YEAR-2}-01-01",TODAY)
@@ -469,10 +499,8 @@ def fig_dd(eq):
 def fig_yr(eq):
     yr=eq["yj_val"].resample("YE").last().pct_change().dropna()*100;f=go.Figure(go.Bar(x=[str(d.year) for d in yr.index],y=yr.values,marker_color=["#2ecc71" if v>=0 else "#e74c3c" for v in yr.values],text=[f"{v:.1f}%" for v in yr.values],textposition="outside"));f.update_layout(title="연도별(%)",template=_D,height=340);return f
 
-# ★ [#8] 레짐 차트 범례 추가
 def fig_regime(eq,price):
     f=go.Figure();f.add_trace(go.Scatter(x=price.index,y=price.values,name="지수",line=dict(color="white",width=1.5)))
-    # 범례용 더미 트레이스
     f.add_trace(go.Scatter(x=[None],y=[None],mode="markers",marker=dict(size=10,color="rgba(30,144,255,0.5)"),name="🟦 Bull"))
     f.add_trace(go.Scatter(x=[None],y=[None],mode="markers",marker=dict(size=10,color="rgba(255,165,0,0.5)"),name="🟧 Bear"))
     f.add_trace(go.Scatter(x=[None],y=[None],mode="markers",marker=dict(size=10,color="rgba(255,50,50,0.5)"),name="🟥 Panic"))
@@ -513,7 +541,7 @@ _PRESETS={"Nasdaq":{"p_vix":"25,30","p_mdd":"-0.12,-0.15,-0.18","p_cb":"50,80,10
 _DEFAULT_PRESET={"p_vix":"25,30","p_mdd":"-0.12,-0.15,-0.18","p_cb":"50,80,100","p_cbr":"-60,-80,-100","p_rb":"50,70,90","p_rbr":"40,60,80","p_ms":"(0.55,0.35,0.15)","p_ds":"(1.0,0.6,0.4)"}
 
 with st.sidebar:
-    st.title("📈 YJ-Quant v8.7")
+    st.title("📈 YJ-Quant v8.8")
     st.subheader("🌍 Step1. 자산")
     asset_name=st.selectbox("투자 대상",list(ASSET_CLASSES.keys()),index=1)
     _cur_preset=_PRESETS.get(asset_name,_DEFAULT_PRESET)
@@ -568,14 +596,13 @@ if _dl_errors:
 with st.expander("⚠️ 백테스트 한계",expanded=False):
     st.markdown("- TopN: 전년도 말 기준 (look-ahead 제거, 생존자 편향 일부 존재)\n- WFV: IS/OOS 크기에 따라 결과 변동\n- 과거 성과 ≠ 미래 수익")
 
-# ═══════════════════════ 7 탭 ★ [#탭순서] 변경 ═══════════════════════
+# ═══════════════════════ 7 탭 ═══════════════════════
 tab1,tab2,tab3,tab4,tab5,tab6,tab7=st.tabs(["🌍 자산레이더","📈 백테스트","🏠 지침","🔄 WFV","🆚 5종비교","📡 종목분석","🔮 미래시뮬"])
 
 # ══════════ Tab1: 자산 레이더 ══════════
 with tab1:
     try:
         st.subheader("🌍 글로벌 자산 상대가치 레이더")
-        # ★ [#1] 48mo/60mo 추가
         rp=st.selectbox("기간",["6mo","12mo","24mo","36mo","48mo","60mo"],index=1,key="rp")
         pd_map={"6mo":126,"12mo":252,"24mo":504,"36mo":756,"48mo":1008,"60mo":1260}
         if st.button("▶ 레이더",type="primary",key="btn_r"):
@@ -596,7 +623,7 @@ with tab1:
             _ai_box("자산레이더",_ai_tab1(sp,rp))
     except Exception as e:st.error(f"Tab1: {e}")
 
-# ══════════ Tab2: 백테스트 (이전 Tab3) ══════════
+# ══════════ Tab2: 백테스트 ══════════
 with tab2:
     try:
         sim_s=f"{start_year}-01-01"
@@ -605,7 +632,10 @@ with tab2:
             if gr:
                 st.session_state["gr"]=gr;best=gr[0];bp={**_BF,**{k:best[k] for k in grid_params.keys()}}
                 for k in ["calmar","annual_ret","mdd","sharpe","total_ret","final_val"]:bp.pop(k,None)
-                st.session_state["bt"]=run_beta(market_df,bp,annual_budget,sim_start=sim_s);st.session_state["best"]=best
+                st.session_state["bt"]=run_beta(market_df,bp,annual_budget,sim_start=sim_s)
+                st.session_state["best"]=best
+                # ★ [#13] 그리드서치 완료 시 단계매집 결과도 자동 생성
+                st.session_state["bt_staged"]=run_beta(market_df,bp,annual_budget,sim_start=sim_s,staged=True)
         if "bt" in st.session_state:
             res=st.session_state["bt"];best=st.session_state.get("best",{});gr=st.session_state.get("gr",[])
             if not res["equity_curve"].empty:
@@ -615,7 +645,6 @@ with tab2:
                 m=res["metrics"];mc=st.columns(6)
                 mc[0].metric("총수익률",f"{m.get('total_return',0):.1f}%");mc[1].metric("연수익률",f"{m.get('annual_return',0):.1f}%");mc[2].metric("MDD",f"{m.get('mdd',0):.1f}%")
                 mc[3].metric("Sharpe",f"{m.get('sharpe',0):.3f}");mc[4].metric("Calmar",f"{m.get('calmar',0):.4f}");mc[5].metric("최종",f"{m.get('final_value',0)/1e8:.2f}억")
-                # ★ [#7] Sharpe/Calmar 설명
                 with st.expander("📖 지표 설명"):
                     st.markdown("- **Sharpe**: 위험(변동성) 1단위당 초과수익. ≥1.0 우수, ≥2.0 매우 우수\n- **Calmar**: 연수익률 ÷ |MDD|. ≥0.3 양호, ≥0.5 우수. MDD 대비 수익 효율")
                 rs=res.get("regime_stats",{})
@@ -626,55 +655,113 @@ with tab2:
                 if res.get("state_logs"):
                     with st.expander(f"📋 상태변경({len(res['state_logs'])}건)"):st.dataframe(pd.DataFrame(res["state_logs"]),use_container_width=True,height=500)
                 if res.get("panic_logs"):
-                    with st.expander(f"🔴 Panic매수({len(res['panic_logs'])}건)"):st.dataframe(pd.DataFrame(res["panic_logs"]),use_container_width=True)
+                    with st.expander(f"🔴 Panic매수({len(res['panic_logs'])}건) — 반복매집(v8.7)"):st.dataframe(pd.DataFrame(res["panic_logs"]),use_container_width=True)
                 if res.get("panic_episodes"):
                     with st.expander(f"📋 Panic에피소드({len(res['panic_episodes'])}건)"):st.dataframe(pd.DataFrame(res["panic_episodes"]),use_container_width=True)
                 if gr:
                     with st.expander(f"📊 Top10/{len(gr)}"):st.dataframe(pd.DataFrame(gr[:10]),use_container_width=True)
                 _ai_box("백테스트",_ai_tab3(res["metrics"],res.get("regime_stats",{}),asset_name))
+
+                # ════ ★ [#13] Panic 매집방식 비교 ════
+                st.markdown("---")
+                st.markdown("### 🆚 Panic 매집방식 비교 (v8.8 신규)")
+                st.markdown("""| 방식 | 로직 | 특징 |
+|---|---|---|
+| 🔁 반복매집 (v8.7) | panic_period마다 MDD 조건 충족 시 반복 매수 | CMA 소진 빠름, 저점 적극 매수 |
+| 🎯 단계매집 (v8.8) | MDD 구간 진입 시 최초 1회만 매수 (1차→2차→3차) | CMA 보존, 더 깊은 저점 집중 |""")
+
+                if "bt_staged" not in st.session_state:
+                    if st.button("▶ 단계매집 시뮬레이션 실행",key="btn_staged"):
+                        best2=st.session_state.get("best",{})
+                        bp2={**_BF,**{k:best2.get(k,(grid_params[k][0] if isinstance(grid_params[k],list) else grid_params[k])) for k in grid_params.keys()}}
+                        for k in ["calmar","annual_ret","mdd","sharpe","total_ret","final_val"]:bp2.pop(k,None)
+                        with st.spinner("단계매집 시뮬 중..."):
+                            st.session_state["bt_staged"]=run_beta(market_df,bp2,annual_budget,sim_start=sim_s,staged=True)
+
+                if "bt_staged" in st.session_state:
+                    res_rep=st.session_state["bt"]
+                    res_stg=st.session_state["bt_staged"]
+                    cp_res={"🔁 반복매집(v8.7)":res_rep,"🎯 단계매집(v8.8)":res_stg}
+
+                    # 지표 비교 테이블
+                    cmp_rows=[]
+                    for name,r in cp_res.items():
+                        mm=r.get("metrics",{});rrs=r.get("regime_stats",{})
+                        cmp_rows.append({"방식":name,"연수익률(%)":mm.get("annual_return",0),"MDD(%)":mm.get("mdd",0),
+                                         "Sharpe":mm.get("sharpe",0),"Calmar":mm.get("calmar",0),
+                                         "최종(억)":round(mm.get("final_value",0)/1e8,2),
+                                         "Panic매수횟수":rrs.get("P매수",0),"Panic매집총액(만)":rrs.get("P총(만)",0)})
+                    st.dataframe(pd.DataFrame(cmp_rows).set_index("방식"),use_container_width=True)
+
+                    # 수익 곡선 비교
+                    f_cmp=go.Figure()
+                    cmp_colors={"🔁 반복매집(v8.7)":"#00d084","🎯 단계매집(v8.8)":"#2196f3"}
+                    for name,r in cp_res.items():
+                        if r and not r["equity_curve"].empty:
+                            eq2=r["equity_curve"]
+                            f_cmp.add_trace(go.Scatter(x=eq2.index,y=eq2["yj_val"]/1e8,name=name,line=dict(color=cmp_colors.get(name,"#aaa"),width=2.5)))
+                    if not res["dca_curve"].empty:
+                        f_cmp.add_trace(go.Scatter(x=res["dca_curve"].index,y=res["dca_curve"]["portfolio_value"]/1e8,name="DCA(기준)",line=dict(color="#ff9800",dash="dot",width=1.5)))
+                    f_cmp.update_layout(title=f"Panic 매집방식 비교 — {asset_name} (억원)",template=_D,height=460)
+                    st.plotly_chart(f_cmp,use_container_width=True)
+
+                    # Drawdown 비교
+                    f_dd2=go.Figure()
+                    for name,r in cp_res.items():
+                        if r and not r["equity_curve"].empty:
+                            eq2=r["equity_curve"];dd2=((eq2["yj_val"]/eq2["yj_val"].cummax())-1)*100
+                            f_dd2.add_trace(go.Scatter(x=eq2.index,y=dd2,name=name,line=dict(color=cmp_colors.get(name,"#aaa"),width=1.8)))
+                    f_dd2.update_layout(title="Drawdown 비교(%)",template=_D,height=300)
+                    st.plotly_chart(f_dd2,use_container_width=True)
+
+                    # Panic 매수 로그 비교
+                    c_log1,c_log2=st.columns(2)
+                    with c_log1:
+                        plogs_rep=res_rep.get("panic_logs",[])
+                        with st.expander(f"🔁 반복매집 Panic로그 ({len(plogs_rep)}건)"):
+                            if plogs_rep:st.dataframe(pd.DataFrame(plogs_rep),use_container_width=True)
+                            else:st.caption("Panic 매수 없음")
+                    with c_log2:
+                        plogs_stg=res_stg.get("panic_logs",[])
+                        with st.expander(f"🎯 단계매집 Panic로그 ({len(plogs_stg)}건)"):
+                            if plogs_stg:st.dataframe(pd.DataFrame(plogs_stg),use_container_width=True)
+                            else:st.caption("Panic 매수 없음")
+
+                    _ai_box("Panic 매집방식 비교",_ai_panic_cmp(cp_res),accent="#9c27b0")
+
         else:st.info("▶ 그리드서치를 시작하세요.")
     except Exception as e:st.error(f"Tab2: {e}")
 
-# ══════════ Tab3: 지침 ★ [#2.5] 백테스트 필수 + [#3] 날짜선택 + [#4] 종가 + [#5] 차트 ══════════
+# ══════════ Tab3: 지침 ══════════
 with tab3:
     try:
-        # ★ [#2.5] 백테스트 미실행 시 안내
         if "bt" not in st.session_state or st.session_state["bt"]["equity_curve"].empty:
             st.warning("⚠️ 먼저 [📈 백테스트] 탭에서 그리드서치를 실행하세요. 1위 파라미터를 기준으로 오늘의 지침이 생성됩니다.")
         else:
-            # ★ 1위 파라미터 사용
             best=st.session_state.get("best",{})
             pt2={k:best.get(k,(grid_params[k][0] if isinstance(grid_params[k],list) else grid_params[k])) for k in grid_params.keys()}
             st.caption(f"📌 백테스트 1위 파라미터 기준 (vix_panic={pt2.get('vix_panic')}, cci_bull={pt2.get('cci_bull')}, ...)")
-
             en=add_ind(market_df)
-            # ★ [#3] 날짜 선택
             min_date=en.dropna(subset=["MA_200"]).index[0].date();max_date=en.index[-1].date()
             sel_date=st.date_input("📅 기준일 선택",value=max_date,min_value=min_date,max_value=max_date,key="guide_date")
             sel_ts=pd.Timestamp(sel_date)
             if sel_ts not in en.index:
                 nearest=en.index[en.index.get_indexer([sel_ts],method="nearest")[0]];sel_ts=nearest
             la=en.loc[sel_ts]
-
             vn=float(la.get("VIX",15));cn=float(la.get("CCI",0));rn=float(la.get("RSI",50))
             mn=float(la.get("MDD",0));dn=float(la.get("Disp",0))
             reg=_state("Bull",vn,cn,rn,mn,dn,pt2)
-
             st.subheader(f"🏠 {asset_name} | {sel_ts.date()} | {reg}")
-            # ★ [#4] 종가 표시
             price_val=float(la.get("Price",0));cur_sym=ASSET_CLASSES[asset_name]["cur"]
             c1,c2,c3,c4,c5,c6=st.columns(6)
             c1.metric("종가",f"{cur_sym}{price_val:,.2f}")
             c2.metric("VIX",f"{vn:.1f}");c3.metric("CCI",f"{cn:.0f}");c4.metric("RSI",f"{rn:.0f}")
             c5.metric("MDD",f"{mn*100:.1f}%");c6.metric("Disp%",f"{dn:.1f}")
-
             if reg=="Bull":st.success(f"🟢 **Bull** — 레버리지 유지")
             elif reg=="Bear":st.warning(f"🟡 **Bear** — 레버리지 축소")
             else:
                 msets_t=list(pt2["mdd_threshold_sets"]) if isinstance(pt2["mdd_threshold_sets"],(list,tuple)) else [0.45,0.30,0.15]
                 st.error(f"🔴 **Panic** — {_mstg(abs(mn),msets_t)} | 드레인!")
-
-            # ★ [#5] 지수/지표 미니 차트
             with st.expander("📊 최근 120일 지표 차트",expanded=True):
                 chart_df=en.loc[:sel_ts].tail(120)
                 if not chart_df.empty:
@@ -687,11 +774,9 @@ with tab3:
                     fig5.add_trace(go.Scatter(x=chart_df.index,y=chart_df["VIX"],name="VIX",line=dict(color="#ff4444",dash="dot")),row=3,col=1)
                     fig5.update_layout(template=_D,height=500,showlegend=True)
                     st.plotly_chart(fig5,use_container_width=True)
-
             st.markdown("---")
             sr_v=pt2.get("stock_ratio",15);d_stock_amt=(annual_budget*sr_v/18)/TRADING_DAYS;d_cma_amt=(annual_budget*(18-sr_v)/18)/TRADING_DAYS
-            bt_res=st.session_state["bt"]
-            last_eq=bt_res["equity_curve"].iloc[-1]
+            bt_res=st.session_state["bt"];last_eq=bt_res["equity_curve"].iloc[-1]
             c7,c8,c9=st.columns(3)
             c7.metric("💰 CMA",f"{last_eq['yj_cs']/1e4:,.0f}만원");c8.metric("📈 ETF",f"{last_eq['yj_st']/1e4:,.0f}만원");c9.metric("💼 총자산",f"{last_eq['yj_val']/1e8:.2f}억원")
             ca,cb2=st.columns(2);ca.info(f"📥 ETF매수: **{d_stock_amt:,.0f}원** ({sr_v}/18)");cb2.info(f"🏦 CMA적립: **{d_cma_amt:,.0f}원** ({18-sr_v}/18)")
@@ -804,7 +889,7 @@ with tab6:
             if fd is not None:st.markdown("#### P/OI");st.dataframe(fd,use_container_width=True)
     except Exception as e:st.error(f"Tab6: {e}")
 
-# ══════════ Tab7: 미래시뮬 ★ [#12] 수익률 중심 ══════════
+# ══════════ Tab7: 미래시뮬 ══════════
 with tab7:
     try:
         st.subheader(f"🔮 {asset_name} 미래 수익률 시뮬레이션")
@@ -820,7 +905,6 @@ with tab7:
                 sim=st.session_state["sim"];mn2=st.session_state.get("sm","")
                 cv=sim['current_val'];ti=sim['total_invested'];yrs=sim['years']
                 st.markdown(f"### {mn2} {yrs}년 | 현재:{cv/1e8:.2f}억 → 투자:{ti/1e8:.2f}억")
-                # ★ [#12] 수익률 중심 테이블
                 prows=[]
                 for p in [5,10,25,50,75,90,95]:
                     fval=sim["percentiles"][f"p{p}"];growth=(fval/cv-1)*100;annual_g=((fval/cv)**(1/yrs)-1)*100 if cv>0 else 0
