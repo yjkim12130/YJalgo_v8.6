@@ -1,18 +1,13 @@
 """
-YJ-Quant Dashboard v8.9
-v8.9 변경 (vs v8.8):
-  [#1]  MDD세트/드레인 복수 입력 포맷 안내 추가 (| 구분)
-  [#2]  Step4: 반복매집/단계매집 사용자 선택 → staged 전역 변수
-  [#3]  지침탭 Price 차트 표시 수정
-  [#4]  지침탭 Panic 시 CMA 잔고 + 매집 지침 금액 표출
-  [#5]  5종비교 TopN 1~10 number_input
-  [#6]  종목분석 티커 가이드 추가
-  [#7]  레버리지 음수(인버스) 입력 안내
-  [#8]  주요 변수 설명 추가
-  [#9]  📖 가이드 탭 신설 (첫 탭)
-  [#10] 지침탭 ETF→TopN 지침 추가
-  [#11] 5종비교 staged 매집 방식 적용
-  [#12] 미래시뮬 수익률 중심 + 상위X% 표현
+YJ-Quant Dashboard v9.0
+v9.0 변경 (vs v8.9):
+  [#1]  Step5 Alpha 제거 (5종비교 탭이 동일 시나리오를 모두 커버)
+        - 사이드바 Step5 Alpha 블록 삭제, Step6 WFV → Step5 WFV 번호 조정
+        - run_alpha 함수는 5종비교 탭(전략 2~4)에서 계속 사용
+  [#2]  시계열 데이터 길이 자동 최적화
+        - 자산별 실제 데이터 시작연도를 감지 (data_safe_min_year = 데이터시작+3년)
+        - start_year < data_safe_min_year 시 자동 조정 + 경고 표시
+        - 백테스트·WFV 모두 적용
 """
 import itertools, time
 from datetime import date
@@ -521,6 +516,86 @@ def _pts(s):
         return result if result else [(0.45,0.30,0.15)]
     except:return [(0.45,0.30,0.15)]
 
+# ═══════════════════════ 산업분석 데이터 ═══════════════════════
+SECTOR_INFO={
+    "IT":          {"group":"A","tickers":{"US":["NVDA","AAPL","MSFT","AVGO","AMD"],"KR":["005930.KS"],"JP":["6861.T"],"EU":["ASML"],"CN":["0700.HK"]}},
+    "커뮤니케이션":{"group":"A","tickers":{"US":["GOOGL","META","NFLX","DIS","VZ"],"KR":["035420.KS"],"JP":["4689.T"],"EU":["SPOT"],"CN":["9988.HK"]}},
+    "헬스케어":    {"group":"A","tickers":{"US":["JNJ","UNH","LLY","ABT","PFE"],"KR":["207940.KS"],"JP":["4503.T"],"EU":["NVO"],"CN":["1177.HK"]}},
+    "소재":        {"group":"B","tickers":{"US":["LIN","APD","ECL","NEM","FCX"],"KR":["051910.KS"],"JP":["4063.T"],"EU":["BASFY"],"CN":["0914.HK"]},"etf":"XLB","commodity":"HG=F"},
+    "에너지":      {"group":"B","tickers":{"US":["XOM","CVX","COP","SLB","EOG"],"KR":["010950.KS"],"JP":["5020.T"],"EU":["SHEL"],"CN":["0857.HK"]},"etf":"XLE","commodity":"CL=F"},
+    "산업재":      {"group":"B","tickers":{"US":["CAT","DE","HON","GE","RTX"],"KR":["012330.KS"],"JP":["6301.T"],"EU":["SIEGY"],"CN":["0144.HK"]},"etf":"XLI","commodity":"HR=F"},
+    "자유소비재":  {"group":"B","tickers":{"US":["TSLA","AMZN","MCD","NKE","HD"],"KR":["005380.KS"],"JP":["7203.T"],"EU":["BMWYY"],"CN":["1211.HK"]},"etf":"XLY","commodity":"ALI=F"},
+    "금융":        {"group":"C","tickers":{"US":["JPM","BAC","GS","BRK-B","V"],"KR":["105560.KS"],"JP":["8306.T"],"EU":["HSBC"],"CN":["2318.HK"]}},
+    "필수소비재":  {"group":"C","tickers":{"US":["PG","KO","PEP","WMT","COST"],"KR":["051900.KS"],"JP":["2802.T"],"EU":["UL"],"CN":["0291.HK"]}},
+    "유틸리티":    {"group":"C","tickers":{"US":["NEE","DUK","SO","AEP","D"],"KR":["015760.KS"],"JP":["9501.T"],"EU":["EONGY"],"CN":["0002.HK"]}},
+    "부동산":      {"group":"C","tickers":{"US":["PLD","AMT","EQIX","O","SPG"],"KR":["361610.KS"],"JP":["8952.T"],"EU":["SEGRO.L"],"CN":["00823.HK"]}},
+}
+_CFLAG={"US":"🇺🇸","KR":"🇰🇷","JP":"🇯🇵","EU":"🇪🇺","CN":"🇨🇳","custom":"⭐"}
+_GCOL={"A":"#2196f3","B":"#ff9800","C":"#00d084"}
+_SPREAD_LABEL={"소재":"XLB/구리","에너지":"XLE/원유","산업재":"XLI/철강","자유소비재":"XLY/알루미늄"}
+YF_SECTOR_MAP={
+    "Technology":"IT","Communication Services":"커뮤니케이션","Healthcare":"헬스케어",
+    "Basic Materials":"소재","Energy":"에너지","Industrials":"산업재",
+    "Consumer Cyclical":"자유소비재","Financial Services":"금융",
+    "Consumer Defensive":"필수소비재","Utilities":"유틸리티","Real Estate":"부동산",
+}
+
+def _ni_turnaround(qf):
+    if qf is None or qf.empty:return None
+    for lb in ["Net Income","Net Income Common Stockholders","Net Income From Continuing Operations"]:
+        if lb in qf.index:
+            ni=qf.loc[lb].dropna()
+            if len(ni)>=2:return bool(float(ni.iloc[1])<0 and float(ni.iloc[0])>0)
+    return None
+
+@st.cache_data(ttl=86400,show_spinner=False)
+def fetch_ticker_signals(ticker):
+    try:
+        t=yf.Ticker(ticker);info=t.info
+        price=float(info.get("currentPrice") or info.get("regularMarketPrice") or 0)
+        if price<=0:return {"ticker":ticker,"error":"no price","name":ticker}
+        tgt_low=info.get("targetLowPrice");tgt_mean=float(info.get("targetMeanPrice") or 0)
+        rec=info.get("recommendationMean");n_an=int(info.get("numberOfAnalystOpinions") or 0)
+        mktcap=float(info.get("marketCap") or 0)
+        upside=(tgt_mean/price-1) if tgt_mean and price>0 else 0
+        sig1=bool(price<tgt_low) if tgt_low else None
+        try:sig2=_ni_turnaround(t.quarterly_financials)
+        except:sig2=None
+        sig3=bool(rec<2.5 and upside>0.15 and n_an>=3) if rec else None
+        fcf_yield=None
+        try:
+            cf=t.cashflow
+            if cf is not None and not cf.empty and mktcap>0:
+                ocf=next((float(cf.loc[lb].iloc[0]) for lb in ["Operating Cash Flow","Cash Flow From Continuing Operating Activities"] if lb in cf.index),0.0)
+                capex=next((float(cf.loc[lb].iloc[0]) for lb in ["Capital Expenditure","Capital Expenditures"] if lb in cf.index),0.0)
+                fcf_yield=(ocf+capex)/mktcap
+        except:pass
+        # 자동 섹터 분류 (yfinance sector 필드 활용)
+        yf_sec=info.get("sector","")
+        auto_sector=YF_SECTOR_MAP.get(yf_sec,"")
+        auto_group=SECTOR_INFO.get(auto_sector,{}).get("group","") if auto_sector else ""
+        return {"ticker":ticker,"name":(info.get("shortName") or ticker)[:22],"price":price,
+                "currency":info.get("currency","?"),"mktcap":mktcap,
+                "tgt_low":tgt_low,"tgt_mean":tgt_mean,"upside_pct":round(upside*100,1),
+                "rec":rec,"n_an":n_an,"fcf_yield":fcf_yield,
+                "sig1":sig1,"sig2":sig2,"sig3":sig3,
+                "auto_sector":auto_sector,"auto_group":auto_group,"yf_sector":yf_sec}
+    except Exception as e:return {"ticker":ticker,"error":str(e),"name":ticker}
+
+@st.cache_data(ttl=86400,show_spinner=False)
+def fetch_macro_spread(etf,commodity):
+    try:
+        raw=yf.download([etf,commodity],period="3mo",progress=False,timeout=20)
+        if raw.empty:return None,None
+        c=(raw["Close"] if not isinstance(raw.columns,pd.MultiIndex) else raw["Close"])
+        if etf not in c.columns or commodity not in c.columns:return None,None
+        c=c[[etf,commodity]].ffill().dropna()
+        if len(c)<15:return None,None
+        norm=c/c.iloc[0]*100;spread=norm[etf]-norm[commodity]
+        sig=bool(spread.iloc[-5:].mean()>spread.iloc[-15:-5].mean())
+        return spread,sig
+    except:return None,None
+
 _PRESETS={
     "Nasdaq":{"p_vix":"25,30","p_mdd":"-0.12,-0.15,-0.18","p_cb":"50,80,100","p_cbr":"-60,-80,-100","p_rb":"50,70,90","p_rbr":"40,60,80","p_ms":"(0.55,0.35,0.15)","p_ds":"(1.0,0.6,0.4)"},
     "S&P 500":{"p_vix":"25","p_mdd":"-0.12,-0.15","p_cb":"50,80,100","p_cbr":"-50,-100","p_rb":"50,70,90","p_rbr":"40,60,80","p_ms":"(0.45,0.30,0.15)","p_ds":"(1.0,0.6,0.4)"}
@@ -578,14 +653,7 @@ with st.sidebar:
     staged=(panic_mode=="🎯 단계매집 (보수적)")
     st.caption("🔁 반복: CMA 빠른 소진, 저점 공격적 매수 | 🎯 단계: CMA 보존, 더 깊은 저점 집중")
 
-    st.subheader("🎯 Step5. Alpha")
-    alpha_mode=st.radio("Alpha 모드",["① TopN 적립식","② Panic Only","③ 하이브리드"],index=1)
-    if alpha_mode.startswith("③"):alpha_dca_ratio=st.slider("적립 비율",0.0,1.0,0.4,0.05)
-    elif alpha_mode.startswith("①"):alpha_dca_ratio=1.0
-    else:alpha_dca_ratio=0.0
-    st.caption(f"TopN **{alpha_dca_ratio*100:.0f}%** + CMA **{(1-alpha_dca_ratio)*100:.0f}%**")
-
-    st.subheader("🔄 Step6. WFV")
+    st.subheader("🔄 Step5. WFV")
     wc1,wc2=st.columns(2)
     wfv_is=wc1.number_input("IS(년)",2,10,4)
     wfv_oos=wc2.number_input("OOS(년)",1,5,1)
@@ -614,12 +682,15 @@ if market_df.empty:
     st.stop()
 if end_year<CUR_YEAR:market_df=market_df[market_df.index<=pd.Timestamp(fetch_end)]
 st.success(f"✅ **{asset_name}** {market_df.index[0].date()}~{market_df.index[-1].date()} ({len(market_df)}일)")
+data_safe_min_year=market_df.index[0].year+3
+if start_year<data_safe_min_year:
+    st.sidebar.info(f"ℹ️ {asset_name} 데이터 시작: {market_df.index[0].year}년 → 최소 시작연도 **{data_safe_min_year}년** 으로 조정됩니다")
 if _dl_errors:
     with st.expander(f"⚠️ 경고({len(_dl_errors)}건)",expanded=False):
         for e in _dl_errors[-10:]:st.caption(e)
 
 # ═══════════════════════ 8 탭 ═══════════════════════
-tab0,tab1,tab2,tab3,tab4,tab5,tab6,tab7=st.tabs(["📖 가이드","🌍 자산레이더","📈 백테스트","🏠 지침","🔄 WFV","🆚 5종비교","📡 종목분석","🔮 미래시뮬"])
+tab0,tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8=st.tabs(["📖 가이드","🌍 자산레이더","📈 백테스트","🏠 지침","🔄 WFV","🆚 5종비교","📡 종목분석","🔮 미래시뮬","🏭 산업분석"])
 
 # ══════════ Tab0: 가이드 ██ [#9] ══════════
 with tab0:
@@ -675,6 +746,7 @@ with tab0:
 | 🆚 5종비교 | ETF Only, ETF+CMA, TopN Only, TopN+CMA, ETF→TopN 5가지 전략 비교 |
 | 📡 종목분석 | 개별 주식 과열/저평가 분석 및 상대 저평가 스크리닝 |
 | 🔮 미래시뮬 | 몬테카를로/블록부트스트랩으로 향후 N년 수익률 예측 |
+| 🏭 산업분석 | Bottom-Up 스크리닝. 11개 GICS 섹터 × 3그룹(A성장/B경기민감/C방어) 시그널 분석 |
 """)
 
     with st.expander("❓ 자주 묻는 질문 (FAQ)"):
@@ -682,8 +754,6 @@ with tab0:
 **Q. 생존자 편향이 없나요? (TopN 전략)**
 A. 전년도 시총 Top10 기반으로 투자하므로 일부 생존자 편향 존재합니다. 다만 시총 상위 기업은 실질적으로 파산 위험이 매우 낮아 영향이 제한적입니다. 완전한 제거는 불가능하며 이 점을 감안하고 해석하세요.
 
-**Q. Step5 Alpha 모드와 5종비교 탭의 관계는?**
-A. ① TopN 적립식 → 매일 TopN 주식에 적립 (5종비교 2~3번과 유사) | ② Panic Only → 평소 ETF, Panic 시 CMA로 TopN 매수 (5종비교 4번 ETF→TopN과 유사) | ③ 하이브리드 → ETF + 일부 TopN 적립 + Panic 시 CMA 투입
 
 **Q. MDD세트/드레인 복수 입력은 어떻게?**
 A. `|` 기호로 구분. 예: `(0.55,0.35,0.15)|(0.45,0.30,0.10)` → 두 세트를 그리드서치에서 모두 탐색
@@ -719,7 +789,10 @@ with tab1:
 # ══════════ Tab2: 백테스트 ══════════
 with tab2:
     try:
-        sim_s=f"{start_year}-01-01"
+        _eff_start=max(start_year,data_safe_min_year)
+        sim_s=f"{_eff_start}-01-01"
+        if start_year<data_safe_min_year:
+            st.info(f"ℹ️ {asset_name} 데이터 시작({market_df.index[0].year}년)으로 인해 시뮬 시작을 **{data_safe_min_year}년** 으로 자동 조정")
         mode_label="단계매집" if staged else "반복매집"
         if st.button(f"▶ {asset_name} 그리드서치 [{mode_label}]",type="primary",key="btn_bt"):
             prog=st.progress(0)
@@ -918,7 +991,7 @@ with tab4:
         st.caption(f"WFV 그리드: {wfv_n}조합")
         if st.button("▶ WFV",type="primary",key="btn_wfv"):
             prog=st.progress(0)
-            wr=run_wfv(market_df,_BF,annual_budget,wfv_is,wfv_oos,wfv_grid,lambda v:prog.progress(min(v,1.0),text=f"WFV {v*100:.0f}%"),sim_start=f"{start_year}-01-01",staged=staged)
+            wr=run_wfv(market_df,_BF,annual_budget,wfv_is,wfv_oos,wfv_grid,lambda v:prog.progress(min(v,1.0),text=f"WFV {v*100:.0f}%"),sim_start=f"{max(start_year,data_safe_min_year)}-01-01",staged=staged)
             prog.empty();st.session_state["wfv"]=wr
         if "wfv" in st.session_state:
             wr=st.session_state["wfv"]
@@ -956,7 +1029,7 @@ with tab5:
             if end_year<CUR_YEAR:cmp_data=cmp_data[cmp_data.index<=pd.Timestamp(fetch_end)]
             sclose,spy=fetch_stocks(fetch_start)
             if end_year<CUR_YEAR:sclose=sclose[sclose.index<=pd.Timestamp(fetch_end)]
-            sim_s5=f"{start_year}-01-01";results={}
+            sim_s5=f"{max(start_year,data_safe_min_year)}-01-01";results={}
             if not cmp_data.empty:
                 # ★ [#11] staged 적용
                 with st.spinner("0.ETF Only..."):results["0.ETF Only"]=run_beta(cmp_data,{**p_base,"stock_ratio":18},annual_budget,sim_start=sim_s5,staged=staged)
@@ -1091,3 +1164,215 @@ with tab7:
                 st.plotly_chart(fig_mc_h(sim,mn2),use_container_width=True)
                 _ai_box("미래시뮬",_ai_tab7(sim,yrs,mn2),accent="#ffd700")
     except Exception as e:st.error(f"Tab7: {e}")
+
+# ══════════ Tab8: 산업분석 ══════════
+with tab8:
+    try:
+        st.caption("🏭 Bottom-Up 산업 스크리닝 | 그룹A(IT/커뮤니케이션/헬스케어) · 그룹B(소재/에너지/산업재/자유소비재) · 그룹C(금융/필수소비재/유틸리티/부동산)")
+
+        # ── 필터 ──
+        fc1,fc2,fc3=st.columns(3)
+        sel_group=fc1.multiselect("그룹 필터",["A","B","C"],default=["A","B","C"],help="A=성장/혁신  B=경기민감  C=방어/현금")
+        sel_sectors=fc2.multiselect("섹터 필터",list(SECTOR_INFO.keys()),default=list(SECTOR_INFO.keys()))
+        sel_countries=fc3.multiselect("국가 필터",["US","KR","JP","EU","CN"],default=["US","KR","JP","EU","CN"])
+
+        # ── 사용자 추가 티커 ──
+        st.markdown("#### ➕ 사용자 추가 종목")
+        user_raw=st.text_input("티커 입력 (쉼표 구분)",value="",
+            placeholder="예: TSM, 035720.KS, 7974.T",
+            help="yfinance 형식 | 미국=티커 | 한국=티커.KS | 일본=티커.T | HK=티커.HK\nyfinance sector 필드로 자동 분류. 인식 실패 시 아래에서 수동 선택.")
+        user_tickers=[x.strip().upper() for x in user_raw.split(",") if x.strip()]
+
+        # 자동 분류 실패 티커 수동 지정 UI (이전 실행 결과 기반)
+        manual_overrides={}
+        if "rows8_raw" in st.session_state:
+            unclassified=[d["ticker"] for d in st.session_state["rows8_raw"]
+                          if d.get("_is_custom") and not d.get("auto_sector")]
+            if unclassified:
+                st.warning(f"⚠️ 자동 분류 실패: {', '.join(unclassified)} — 섹터를 직접 지정하세요.")
+                for uc in unclassified:
+                    ov_sec=st.selectbox(f"{uc} 섹터",list(SECTOR_INFO.keys()),key=f"ov_{uc}")
+                    manual_overrides[uc]=ov_sec
+
+        # ── 분석 대상 수집 ──
+        target_list=[]  # (ticker, sector, country, group, is_custom)
+        for sec,si in SECTOR_INFO.items():
+            if sec not in sel_sectors or si["group"] not in sel_group:continue
+            for country,tks in si["tickers"].items():
+                if country not in sel_countries:continue
+                for tk in tks:target_list.append((tk,sec,country,si["group"],False))
+        for tk in user_tickers:
+            target_list.append((tk,"","custom","",True))
+
+        n_total=len(target_list)
+        st.caption(f"분석 대상: **{n_total}종목** (기본 {n_total-len(user_tickers)}개 + 사용자 {len(user_tickers)}개) | 캐시: 일 1회 갱신")
+
+        if st.button("▶ 스크리닝 실행",type="primary",key="btn_sector_run"):
+            prog8=st.progress(0)
+            raw_list=[]
+            for i,(tk,sec,country,grp,is_custom) in enumerate(target_list):
+                prog8.progress((i+1)/n_total,text=f"[{i+1}/{n_total}] {tk} 분석중...")
+                d=fetch_ticker_signals(tk)
+                if is_custom:
+                    if d.get("auto_sector"):
+                        sec=d["auto_sector"];grp=d.get("auto_group","")
+                    elif tk in manual_overrides:
+                        sec=manual_overrides[tk];grp=SECTOR_INFO.get(sec,{}).get("group","")
+                    d["_is_custom"]=True
+                else:
+                    d["_is_custom"]=False
+                d.update({"sector":sec,"country":country,"group":grp})
+                raw_list.append(d)
+            prog8.empty()
+            st.session_state["rows8_raw"]=raw_list
+
+            # 그룹B 매크로 스프레드
+            sp_cache={}
+            for sec in ["소재","에너지","산업재","자유소비재"]:
+                if sec in sel_sectors and "B" in sel_group and SECTOR_INFO[sec].get("etf"):
+                    sp,sig=fetch_macro_spread(SECTOR_INFO[sec]["etf"],SECTOR_INFO[sec]["commodity"])
+                    sp_cache[sec]={"spread":sp,"sig":sig,"label":_SPREAD_LABEL.get(sec,sec)}
+            st.session_state["sp_cache"]=sp_cache
+
+            # 그룹C FCF Yield 섹터 내 상위 20%
+            from collections import defaultdict as _dd
+            sec_fcf=_dd(list)
+            for d in raw_list:
+                if d.get("group")=="C" and d.get("fcf_yield") is not None:
+                    sec_fcf[d["sector"]].append((d["ticker"],d["fcf_yield"]))
+            fcf_top20=set()
+            for sec,pairs in sec_fcf.items():
+                pairs.sort(key=lambda x:x[1],reverse=True)
+                top_n=max(1,round(len(pairs)*0.2))
+                for tk2,_ in pairs[:top_n]:fcf_top20.add(tk2)
+
+            # 점수 계산
+            rows8=[]
+            for d in raw_list:
+                if "error" in d and not d.get("name"):continue
+                grp=d.get("group","?");sec=d.get("sector","")
+                sp5=sp_cache.get(sec,{}).get("sig",False)
+                sig4=d["ticker"] in fcf_top20 if grp=="C" else None
+
+                if grp=="A":
+                    score=(1 if d.get("sig3") else 0)+(1 if d.get("sig2") else 0)
+                    verdict="🟢강매수" if score==2 else("🟡관심" if score==1 else "⚪대기")
+                elif grp=="B":
+                    score=(1 if d.get("sig1") else 0)+(1 if sp5 else 0)
+                    verdict="🟢저점매수" if score==2 else("🟡스프레드확인" if score==1 else "⚪대기")
+                elif grp=="C":
+                    score=1 if sig4 else 0
+                    warn=[]
+                    if d.get("sig1") is True:warn.append("⚠️목표가↓")
+                    if d.get("sig2") is False:warn.append("⚠️적자지속")
+                    verdict=("🟢현금우량" if score==1 else "⚪대기")+(" "+" ".join(warn) if warn else "")
+                else:
+                    score=sum(1 for s in ["sig1","sig2","sig3"] if d.get(s) is True)
+                    verdict=f"미분류(점수{score}/3)"
+
+                tag="⭐" if d.get("_is_custom") else ""
+                rows8.append({
+                    "ticker":d["ticker"],"종목명":tag+d.get("name",d["ticker"]),
+                    "국가":_CFLAG.get(d.get("country","?"),d.get("country","?")),
+                    "섹터":sec or "미분류","그룹":grp,
+                    "현재가":f"{d.get('price',0):,.2f} {d.get('currency','')}",
+                    "①목표가하회":"✅" if d.get("sig1") is True else("❌" if d.get("sig1") is False else "−"),
+                    "②흑자전환":"✅" if d.get("sig2") is True else("❌" if d.get("sig2") is False else "−"),
+                    "③ERR상향":"✅" if d.get("sig3") is True else("❌" if d.get("sig3") is False else "−"),
+                    "④FCF상위20%":"✅" if sig4 is True else("❌" if sig4 is False else "−"),
+                    "⑤스프레드반등":"✅" if(grp=="B" and sp5) else("❌" if(grp=="B" and not sp5) else "−"),
+                    "점수":score,"판정":verdict,
+                    "_upside":d.get("upside_pct",0),"_rec":d.get("rec"),
+                    "_n_an":d.get("n_an",0),"_tgt_low":d.get("tgt_low"),
+                    "_tgt_mean":d.get("tgt_mean"),"_fcf":d.get("fcf_yield"),
+                    "_auto_sector":d.get("auto_sector",""),"_yf_sector":d.get("yf_sector",""),
+                })
+            st.session_state["rows8"]=rows8
+
+        # ── 결과 표시 ──
+        if "rows8" in st.session_state and st.session_state["rows8"]:
+            rows8=st.session_state["rows8"]
+            df8=pd.DataFrame(rows8)
+            _DCOLS=["ticker","종목명","국가","섹터","그룹","현재가",
+                    "①목표가하회","②흑자전환","③ERR상향","④FCF상위20%","⑤스프레드반등","점수","판정"]
+
+            def _hl8(row):
+                v=str(row.get("판정",""))
+                if "🟢" in v:return ["background-color:#0d2b0d"]*len(row)
+                if "🟡" in v:return ["background-color:#2b2200"]*len(row)
+                return [""]*len(row)
+
+            def _show_df8(df,grp=None):
+                dg=(df[df["그룹"]==grp].sort_values("점수",ascending=False)
+                    if grp else df.sort_values(["그룹","점수"],ascending=[True,False]))
+                if dg.empty:st.info("해당 종목 없음");return
+                show_cols=[c for c in _DCOLS if c in dg.columns]
+                st.dataframe(dg[show_cols].style.apply(_hl8,axis=1),
+                             use_container_width=True,height=420)
+                green=len(dg[dg["판정"].str.contains("🟢",na=False)])
+                yellow=len(dg[dg["판정"].str.contains("🟡",na=False)])
+                st.caption(f"총 {len(dg)}종목 | 🟢{green} 🟡{yellow} ⚪{len(dg)-green-yellow} | ⭐=사용자 추가")
+
+            ga8,gb8,gc8,gall8=st.tabs(["📘 그룹A 성장","📙 그룹B 경기민감","📗 그룹C 방어","📋 전체"])
+            with ga8:
+                st.markdown("**시그널: ③ ERR상향(추천평균<2.5 + Upside>15%) + ② 흑자전환**")
+                _show_df8(df8,"A")
+            with gb8:
+                st.markdown("**시그널: ① 현재가<최저목표가 + ⑤ 섹터ETF/원자재 스프레드 반등**")
+                _show_df8(df8,"B")
+                sp_cache2=st.session_state.get("sp_cache",{})
+                if sp_cache2:
+                    st.markdown("#### 📊 매크로 스프레드 (섹터ETF − 원자재, 정규화 100 기준)")
+                    f_sp=go.Figure()
+                    sp_colors={"소재":"#9c27b0","에너지":"#ff9800","산업재":"#2196f3","자유소비재":"#00d084"}
+                    for sec2,sv in sp_cache2.items():
+                        if sv.get("spread") is not None:
+                            sp_s=sv["spread"];sig_s=sv["sig"]
+                            f_sp.add_trace(go.Scatter(x=sp_s.index,y=sp_s.values,
+                                name=f"{sv['label']} ({'↑반등' if sig_s else '↓하락중'})",
+                                line=dict(color=sp_colors.get(sec2,"#aaa"),width=2)))
+                    f_sp.add_hline(y=0,line_dash="dash",line_color="white",opacity=0.4)
+                    f_sp.update_layout(title="섹터ETF vs 원자재 스프레드 (3개월, 정규화)",
+                                       template=_D,height=360,yaxis_title="스프레드 포인트",
+                                       legend=dict(orientation="h",y=-0.25))
+                    st.plotly_chart(f_sp,use_container_width=True)
+                    st.caption("스프레드 ↑ = 섹터가 원자재 대비 상대 반등 → 경기민감주 매수 시그널 ✅")
+            with gc8:
+                st.markdown("**시그널: ④ FCF Yield 섹터 내 상위 20% | ⚠️경고: 목표가 대폭 하회 or 적자지속**")
+                _show_df8(df8,"C")
+            with gall8:
+                _show_df8(df8)
+
+            # ── 종목 상세 뷰 ──
+            st.markdown("---")
+            st.markdown("#### 🔍 종목 상세")
+            tickers_ok=[r["ticker"] for r in rows8]
+            sel_det=st.selectbox("종목 선택",["— 선택 —"]+tickers_ok,key="sel_det8")
+            if sel_det!="— 선택 —":
+                det=[r for r in rows8 if r["ticker"]==sel_det]
+                if det:
+                    d8=det[0]
+                    auto_info=""
+                    if d8.get("_auto_sector"):
+                        auto_info=f"  *(yfinance 자동 분류: {d8['_yf_sector']} → {d8['_auto_sector']})*"
+                    st.markdown(f"**{d8['종목명']}** ({sel_det}) | {d8['국가']} | {d8['섹터']} | 그룹 {d8['그룹']}{auto_info}")
+                    dm=st.columns(5)
+                    dm[0].metric("현재가",d8["현재가"])
+                    dm[1].metric("최저목표가",f"{d8.get('_tgt_low') or '−'}")
+                    dm[2].metric("평균목표가",f"{d8.get('_tgt_mean') or '−'}")
+                    dm[3].metric("Upside",f"{d8.get('_upside',0):+.1f}%")
+                    dm[4].metric("추천평균",f"{d8.get('_rec') or '−'} ({d8.get('_n_an',0)}명)")
+                    ds2=st.columns(5)
+                    ds2[0].metric("①목표가하회",d8["①목표가하회"])
+                    ds2[1].metric("②흑자전환",d8["②흑자전환"])
+                    ds2[2].metric("③ERR상향",d8["③ERR상향"])
+                    ds2[3].metric("④FCF상위20%",d8["④FCF상위20%"])
+                    ds2[4].metric("⑤스프레드반등",d8["⑤스프레드반등"])
+                    fcf8=d8.get("_fcf")
+                    if fcf8 is not None:
+                        st.metric("FCF Yield",f"{fcf8*100:.2f}%",
+                                  help="(영업현금흐름 − 설비투자) ÷ 시가총액")
+                    st.metric("종합 점수",f"{d8['점수']}점 → {d8['판정']}")
+        else:
+            st.info("▶ 스크리닝 실행을 눌러 분석을 시작하세요.")
+    except Exception as e:st.error(f"Tab8: {e}")
