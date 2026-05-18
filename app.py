@@ -901,7 +901,7 @@ with tab3:
                     fig5=make_subplots(rows=3,cols=1,shared_xaxes=True,vertical_spacing=0.05,
                                        row_heights=[0.4,0.3,0.3],subplot_titles=["Price & MA200","CCI","RSI & VIX"])
                     px_vals=chart_df["Price"].dropna()
-                    fig5.add_trace(go.Scatter(x=px_vals.index,y=px_vals.values,name="Price",line=dict(color="#ffffff",width=2)),row=1,col=1)
+                    fig5.add_trace(go.Scatter(x=px_vals.index,y=px_vals.values,name="Price",line=dict(color="#800080",width=2)),row=1,col=1)
                     if "MA_200" in chart_df.columns:
                         ma_vals=chart_df["MA_200"].dropna()
                         fig5.add_trace(go.Scatter(x=ma_vals.index,y=ma_vals.values,name="MA200",line=dict(color="#ff9800",dash="dot",width=1.5)),row=1,col=1)
